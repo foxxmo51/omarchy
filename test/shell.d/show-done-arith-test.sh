@@ -5,8 +5,10 @@
 # 'a[$(touch /tmp/pwned)]' would run command substitution. The script must
 # validate the argument before the arithmetic test: only real exit statuses
 # (0-255, ASCII digits read in base 10 even with leading zeros) are accepted.
-# Malformed input is a caller bug and must be an error, never a silent
-# "Done!".
+# Malformed input is a caller bug: it gets a red Failed prompt naming the
+# offending input (shell-quoted, so control characters cannot inject terminal
+# escapes) and the script still waits for a keypress -- never a misleading
+# "Done!", and never a raw stderr dump with no prompt.
 
 set -euo pipefail
 
@@ -36,22 +38,50 @@ write_runner <<'RUNNER'
 #!/bin/bash
 "$ROOT/bin/omarchy-show-done" 'a[$(touch "$SHOW_DONE_MARKER")]'
 RUNNER
-run_under_pty >/dev/null || true
+out=$(run_under_pty)
 [[ ! -e $SHOW_DONE_MARKER ]] ||
   fail "hostile exit-code argument cannot execute commands" "marker file was created: $SHOW_DONE_MARKER"
+[[ $out == *"Failed (invalid exit code"* ]] ||
+  fail "hostile exit code gets a Failed prompt" "$out"
+[[ $out == *"Press any key"* ]] ||
+  fail "hostile exit code still waits for a keypress" "$out"
 pass "hostile exit-code argument cannot execute commands"
 
-# Non-numeric input is an error, not a silent "Done!".
+# Non-numeric input gets a Failed prompt naming it, not a silent "Done!".
 write_runner <<'RUNNER'
 #!/bin/bash
 "$ROOT/bin/omarchy-show-done" abc
 RUNNER
-if out=$(run_under_pty); then
-  fail "non-numeric exit code is an error" "exited 0: $out"
-fi
-[[ $out == *"invalid exit code"* ]] || fail "non-numeric exit code reports the problem" "$out"
+out=$(run_under_pty)
+[[ $out == *"Failed (invalid exit code abc)"* ]] ||
+  fail "non-numeric exit code is named in a Failed prompt" "$out"
+[[ $out == *"Press any key"* ]] ||
+  fail "non-numeric exit code still waits for a keypress" "$out"
 [[ $out != *"Done!"* ]] || fail "non-numeric exit code must not print Done!" "$out"
-pass "non-numeric exit code is an error"
+pass "non-numeric exit code is a Failed prompt"
+
+# Invalid input must still wait for the keypress instead of exiting early:
+# feed only the drain byte through a pipe we keep open (so script(1) never
+# sees stdin EOF and can only leave via its keypress read) and confirm the
+# script is still blocked afterwards.
+write_runner <<'RUNNER'
+#!/bin/bash
+"$ROOT/bin/omarchy-show-done" abc
+RUNNER
+exec {pty_in}> >(script -qec "bash $test_tmp/run.sh" /dev/null >/dev/null 2>&1)
+runner_pid=$!
+printf 'x' >&$pty_in
+sleep 1
+if kill -0 "$runner_pid" 2>/dev/null; then
+  waited=1
+else
+  waited=0
+fi
+exec {pty_in}>&-
+kill "$runner_pid" 2>/dev/null || true
+wait "$runner_pid" 2>/dev/null || true
+(( waited )) || fail "invalid input still waits for a keypress" "exited before any keypress byte was sent"
+pass "invalid input still waits for a keypress"
 
 # 08 is a valid exit status (decimal 8), not an arithmetic error.
 write_runner <<'RUNNER'
@@ -71,6 +101,15 @@ out=$(run_under_pty)
 [[ $out == *"Failed (exit code 10)"* ]] || fail "010 is treated as decimal 10" "$out"
 pass "010 is treated as decimal 10"
 
+# Zero-padded codes are accepted as their decimal value: 0007 is 7.
+write_runner <<'RUNNER'
+#!/bin/bash
+"$ROOT/bin/omarchy-show-done" 0007
+RUNNER
+out=$(run_under_pty)
+[[ $out == *"Failed (exit code 7)"* ]] || fail "0007 is treated as decimal 7" "$out"
+pass "0007 is treated as decimal 7"
+
 # 255 is the largest valid exit status.
 write_runner <<'RUNNER'
 #!/bin/bash
@@ -80,28 +119,46 @@ out=$(run_under_pty)
 [[ $out == *"Failed (exit code 255)"* ]] || fail "255 is accepted" "$out"
 pass "255 is accepted"
 
-# 256 is outside the exit-status range and must be an error.
+# 256 is outside the exit-status range: a Failed prompt, not an error dump.
 write_runner <<'RUNNER'
 #!/bin/bash
 "$ROOT/bin/omarchy-show-done" 256
 RUNNER
-if out=$(run_under_pty); then
-  fail "256 is an error" "exited 0: $out"
-fi
-[[ $out == *"out of range"* ]] || fail "256 reports out of range" "$out"
+out=$(run_under_pty)
+[[ $out == *"Failed (invalid exit code 256)"* ]] || fail "256 reports invalid exit code" "$out"
+[[ $out == *"Press any key"* ]] || fail "256 still waits for a keypress" "$out"
 [[ $out != *"Done!"* ]] || fail "256 must not print Done!" "$out"
-pass "256 is an error"
+pass "256 is an invalid exit code"
 
-# An extremely large number must not wrap around into a "Done!".
+# An extremely large number must not wrap around into a "Done!", and must
+# never reach arithmetic evaluation.
 write_runner <<'RUNNER'
 #!/bin/bash
 "$ROOT/bin/omarchy-show-done" 99999999999999999999999999
 RUNNER
-if out=$(run_under_pty); then
-  fail "huge exit code is an error" "exited 0: $out"
-fi
+out=$(run_under_pty)
+[[ $out == *"Failed (invalid exit code 99999999999999999999999999)"* ]] ||
+  fail "huge exit code reports invalid exit code" "$out"
 [[ $out != *"Done!"* ]] || fail "huge exit code must not print Done!" "$out"
-pass "huge exit code is an error"
+pass "huge exit code is an invalid exit code"
+
+# A raw escape byte in the input must be shell-quoted in the prompt, never
+# passed through to the terminal unquoted. bash %q renders ESC inside the
+# ANSI-C quoted form $'\E[31mRED' (backslash-E, not a raw escape byte).
+write_runner <<'RUNNER'
+#!/bin/bash
+"$ROOT/bin/omarchy-show-done" $'\e[31mRED'
+RUNNER
+out=$(run_under_pty)
+printf '%s' "$out" | grep -qF "\$'\\E[31mRED'" ||
+  fail "raw ESC in input is shell-quoted" "$out"
+# The red prompt itself uses exactly two raw ESC bytes (color on/off); any
+# more would mean the input's escape reached the terminal unquoted.
+esc_count=$(printf '%s' "$out" | tr -cd '\033' | wc -c)
+(( esc_count == 2 )) ||
+  fail "raw ESC in input is shell-quoted" "raw ESC bytes in output: $esc_count"
+[[ $out == *"Press any key"* ]] || fail "ESC input still waits for a keypress" "$out"
+pass "raw ESC in input is shell-quoted"
 
 # A numeric failure still reports its exit code.
 write_runner <<'RUNNER'
@@ -120,3 +177,12 @@ RUNNER
 out=$(run_under_pty)
 [[ $out == *"Done!"* ]] || fail "exit code 0 reports Done!" "$out"
 pass "exit code 0 reports Done!"
+
+# No argument defaults to 0 and reports "Done!".
+write_runner <<'RUNNER'
+#!/bin/bash
+"$ROOT/bin/omarchy-show-done"
+RUNNER
+out=$(run_under_pty)
+[[ $out == *"Done!"* ]] || fail "missing argument reports Done!" "$out"
+pass "missing argument reports Done!"
