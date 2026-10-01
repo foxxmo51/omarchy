@@ -23,9 +23,18 @@ export SHOW_DONE_MARKER="$test_tmp/pwned"
 
 # omarchy-show-done needs /dev/tty, so run it under script(1), which provides
 # a pty. The script drains queued input (0.1s timeout) and then blocks for one
-# keypress, so feed it two bytes: one for the drain, one for the wait.
+# keypress, so keep a keypress byte available until script exits: with a
+# slow-starting child an up-front burst is drained before the blocking read,
+# which then hangs the suite instead of failing.
 run_under_pty() {
-  (printf 'x'; sleep 0.5; printf 'x') | script -qec "bash $test_tmp/run.sh" /dev/null 2>/dev/null
+  coproc keyfeed { while :; do printf 'x'; sleep 0.2; done; }
+  local key_fd=${keyfeed[0]}
+  script -qec "bash $test_tmp/run.sh" /dev/null <&"$key_fd" 2>/dev/null
+  local status=$?
+  exec {key_fd}<&-
+  kill "$keyfeed_PID" 2>/dev/null || true
+  wait "$keyfeed_PID" 2>/dev/null || true
+  return "$status"
 }
 
 write_runner() {
