@@ -119,6 +119,24 @@ out=$(run_under_pty)
 [[ $out == *"Failed (exit code 7)"* ]] || fail "0007 is treated as decimal 7" "$out"
 pass "0007 is treated as decimal 7"
 
+# A pathological all-zero argument must validate promptly, not stall: stripping
+# zeros one at a time is quadratic, so 60000 zeros took ~18s and stalled the
+# script before any prompt. The 10s budget fails the old code and passes the
+# single-pass strip with wide margin either way.
+write_runner <<'RUNNER'
+#!/bin/bash
+zeros=$(printf '%060000d' 0)
+"$ROOT/bin/omarchy-show-done" "$zeros"
+RUNNER
+start=$SECONDS
+out=$(run_under_pty)
+elapsed=$((SECONDS - start))
+(( elapsed < 10 )) ||
+  fail "long all-zero input validates promptly" "validation took ${elapsed}s"
+[[ $out == *"Done!"* ]] ||
+  fail "all-zero input is exit code 0" "$out"
+pass "long all-zero input validates promptly"
+
 # 255 is the largest valid exit status.
 write_runner <<'RUNNER'
 #!/bin/bash
