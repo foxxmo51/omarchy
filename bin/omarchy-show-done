@@ -19,10 +19,10 @@ case $code in
   '' | *[!0-9]*) valid=0 ;;
 esac
 if ((valid)); then
-  stripped=$code
-  while [[ $stripped == 0* ]] && ((${#stripped} > 1)); do
-    stripped=${stripped#0}
-  done
+  # Strip leading zeros in a single expansion: removing them one at a time
+  # stalls on a pathological all-zero argument.
+  stripped=${code#"${code%%[!0]*}"}
+  [[ -z $stripped ]] && stripped=0
   if ((${#stripped} > 3)) || ((10#$stripped > 255)); then
     valid=0
   else
